@@ -1,0 +1,8 @@
+# Build artifact - distributed via GitHub Releases instead of tracked in git
+PinWindow.exe
+
+# Local runtime log
+pinwindow.log
+
+# Ahk2Exe staging
+.staging/
