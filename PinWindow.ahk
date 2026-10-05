@@ -10,15 +10,27 @@ WM_NCHITTEST := 0x0084
 HTCAPTION    := 2
 DWMWA_EXTENDED_FRAME_BOUNDS := 9
 
-BORDER_COLOR := "FF3B30"  ; 固定中インジケータの色 (赤系)
-BORDER_THICK := 6         ; 枠の太さ(px)
+BORDER_COLOR := "00BFFF"  ; 固定中インジケータの色 (水色)
+BORDER_THICK := 3         ; 枠の太さ(px)
 POLL_MS     := 15        ; 追従ポーリング間隔(ms)。ドラッグ中も滑らかに見えるよう短め
 SWEEP_MS    := 2000      ; 内部管理から外れた枠を掃除する間隔(ms)
 MY_PID      := DllCall("GetCurrentProcessId", "UInt")
 
+FADE_OUT_ALPHA := 40   ; カーソルが外に出た時の半透明具合(0-255。約16%)
+FADE_OUT_MS    := 700  ; 半透明になるまでの時間
+FADE_IN_MS     := 150  ; 不透明に戻るまでの時間
+
 pinned      := Map()  ; 対象hwnd -> true
 overlays    := Map()  ; 対象hwnd -> Gui
 overlayHwnd := Map()  ; 枠自身のhwnd -> true (誤クリック除外用)
+zfixStreak  := Map()  ; 対象hwnd -> 連続Zオーダー補正回数
+zfixGiveUp  := Map()  ; 対象hwnd -> true (補正を諦めたウィンドウ。Windows Terminal 等、
+                       ; アプリ自身が内部の補助ウィンドウを常に直上に置き直そうとして
+                       ; 際限なく競合するケースがあるため)
+fadeState    := Map()  ; 対象hwnd -> {target, startAlpha, curAlpha, startTime, duration}
+layeredAdded := Map()  ; 対象hwnd -> true (このスクリプトが WS_EX_LAYERED を追加した場合のみ記録)
+entryState        := Map()  ; 対象hwnd -> {wasInside, mode}  ("side"=縦の辺から進入中 / "topbottom" / "")
+clickThroughAdded := Map()  ; 対象hwnd -> true (このスクリプトがクリック透過を付与した場合のみ記録)
 
 ^+!p:: ClearAllPins()  ; 緊急脱出用: 全ての固定・枠を強制解除する
 
@@ -48,6 +60,28 @@ HandleDragRightClick() {
     Click "Right"
 }
 
+; トラックパッドで「左押したまま右クリック」がやりにくい場合の代替操作:
+; タイトルバーを Alt+クリック(1回のクリックだけで済む)。Alt+クリックは
+; Windowsのタイトルバー操作として標準では使われていない組み合わせなので、
+; 上のホールド+右クリックとも衝突しない。
+#InputLevel 1
+!LButton:: HandleAltClick()
+#InputLevel 0
+
+HandleAltClick() {
+    global WM_NCHITTEST, HTCAPTION, overlayHwnd
+
+    MouseGetPos(&mx, &my, &winHwnd)
+
+    if (winHwnd && !overlayHwnd.Has(winHwnd) && IsTitleBarHit(winHwnd, mx, my)) {
+        TogglePin(winHwnd)
+        return
+    }
+
+    ; タイトルバー以外なら通常のAlt+クリックとして再送する
+    Click
+}
+
 TogglePin(hwnd) {
     global pinned
     if pinned.Has(hwnd)
@@ -60,6 +94,8 @@ ClearAllPins() {
     global pinned, overlays, overlayHwnd
     for hwnd in pinned.Clone() {
         try WinSetAlwaysOnTop(0, "ahk_id " hwnd)
+        DisableFadeSupport(hwnd)
+        SetClickThrough(hwnd, false)
     }
     for hwnd, ov in overlays.Clone() {
         try ov.Destroy()
@@ -124,7 +160,136 @@ PinWindow(hwnd) {
     try title := WinGetTitle("ahk_id " hwnd)
     LogEvent("PIN hwnd=" hwnd " title=" title " alreadyTracked=" pinned.Has(hwnd))
     pinned[hwnd] := true
+    EnableFadeSupport(hwnd)
     UpdateOverlay(hwnd)
+}
+
+; カーソルがウィンドウの外に出ている間、半透明にして見た目だけ透過させる準備をする
+; (クリックは透過させない。見えるだけ)。WS_EX_LAYERED が無いウィンドウには付与し、
+; 元々付いていなかった場合のみ解除時に外す(既にレイヤードなアプリの挙動を壊さない)。
+EnableFadeSupport(hwnd) {
+    global layeredAdded
+    WS_EX_LAYERED := 0x80000
+    exStyle := DllCall("GetWindowLongPtr", "Ptr", hwnd, "Int", -20, "Ptr")
+    if !(exStyle & WS_EX_LAYERED) {
+        try DllCall("SetWindowLongPtr", "Ptr", hwnd, "Int", -20, "Ptr", exStyle | WS_EX_LAYERED)
+        layeredAdded[hwnd] := true
+    }
+    try DllCall("SetLayeredWindowAttributes", "Ptr", hwnd, "UInt", 0, "UChar", 255, "UInt", 2) ; LWA_ALPHA
+}
+
+DisableFadeSupport(hwnd) {
+    global layeredAdded, fadeState
+    try DllCall("SetLayeredWindowAttributes", "Ptr", hwnd, "UInt", 0, "UChar", 255, "UInt", 2)
+    if layeredAdded.Has(hwnd) {
+        WS_EX_LAYERED := 0x80000
+        exStyle := DllCall("GetWindowLongPtr", "Ptr", hwnd, "Int", -20, "Ptr")
+        try DllCall("SetWindowLongPtr", "Ptr", hwnd, "Int", -20, "Ptr", exStyle & ~WS_EX_LAYERED)
+        layeredAdded.Delete(hwnd)
+    }
+    if fadeState.Has(hwnd)
+        fadeState.Delete(hwnd)
+}
+
+; 対象ウィンドウに WS_EX_TRANSPARENT を付けて、クリックを裏のウィンドウへ
+; 素通りさせる(半透明の見た目はそのまま、操作だけ裏に通す)。既に付いていた
+; 場合(アプリ自身の設定)は触らない/外さない。
+SetClickThrough(hwnd, enable) {
+    global clickThroughAdded
+    WS_EX_TRANSPARENT := 0x20
+    exStyle := DllCall("GetWindowLongPtr", "Ptr", hwnd, "Int", -20, "Ptr")
+    hasIt := (exStyle & WS_EX_TRANSPARENT) != 0
+    if (enable && !hasIt) {
+        try DllCall("SetWindowLongPtr", "Ptr", hwnd, "Int", -20, "Ptr", exStyle | WS_EX_TRANSPARENT)
+        clickThroughAdded[hwnd] := true
+    } else if (!enable && hasIt && clickThroughAdded.Has(hwnd)) {
+        try DllCall("SetWindowLongPtr", "Ptr", hwnd, "Int", -20, "Ptr", exStyle & ~WS_EX_TRANSPARENT)
+        clickThroughAdded.Delete(hwnd)
+    }
+}
+
+; 対象ウィンドウの中心点がどのモニタ上にあるかを探し、そのモニタの中心と比べて
+; 右/左・上/下のどちら寄りかを判定する。「画面の最寄りの角に面した2辺」を
+; 固定ウィンドウへのアクセス辺として返す(残り2辺=中央寄りの辺は背面操作用)。
+GetAccessEdges(wx, wy, ww, wh) {
+    cx := wx + ww / 2
+    cy := wy + wh / 2
+    monCx := A_ScreenWidth / 2, monCy := A_ScreenHeight / 2  ; 見つからなかった時のフォールバック
+    count := MonitorGetCount()
+    loop count {
+        MonitorGet(A_Index, &l, &t, &r, &b)
+        if (cx >= l && cx < r && cy >= t && cy < b) {
+            monCx := (l + r) / 2
+            monCy := (t + b) / 2
+            break
+        }
+    }
+    edges := Map()
+    edges[(cy >= monCy) ? "bottom" : "top"] := true
+    edges[(cx >= monCx) ? "right" : "left"] := true
+    return edges
+}
+
+; カーソルが対象ウィンドウの矩形内にあるかどうかで、半透明⇔不透明を滑らかにアニメーションする。
+; どの辺から入ったかに加えて「その辺が画面の最寄りの角に面しているか」も見る。
+; 画面中央寄りの辺(=普段のカーソル移動で素通りしやすい側)から入った場合は
+; 半透明・クリック透過のままにし、画面の端に意図的にカーソルを寄せてから
+; 進入した場合(角に面した2辺から)だけ、固定ウィンドウ自体を操作できるようにする。
+UpdateFade(hwnd, wx, wy, ww, wh) {
+    global fadeState, FADE_OUT_ALPHA, FADE_OUT_MS, FADE_IN_MS, entryState
+    MouseGetPos(&mx, &my)
+    inside := (mx >= wx && mx < wx + ww && my >= wy && my < wy + wh)
+
+    if !entryState.Has(hwnd)
+        entryState[hwnd] := Map("wasInside", false, "mode", "", "prevMx", mx, "prevMy", my)
+    est := entryState[hwnd]
+
+    if (inside && !est["wasInside"]) {
+        ; 外→中に切り替わった瞬間。直前(外にいた時)のカーソル位置から
+        ; 具体的にどの辺(上下左右)を越えてきたかを特定する。
+        px := est["prevMx"], py := est["prevMy"]
+        dxLeft := wx - px, dxRight := px - (wx + ww)
+        dyTop := wy - py, dyBottom := py - (wy + wh)
+        dx := Max(dxLeft, dxRight, 0)
+        dy := Max(dyTop, dyBottom, 0)
+        crossedEdge := (dx > dy) ? ((dxLeft > dxRight) ? "left" : "right")
+                                  : ((dyTop > dyBottom) ? "top" : "bottom")
+        accessEdges := GetAccessEdges(wx, wy, ww, wh)
+        est["mode"] := accessEdges.Has(crossedEdge) ? "access" : "through"
+    }
+    if !inside
+        est["mode"] := ""
+    est["wasInside"] := inside
+    est["prevMx"] := mx
+    est["prevMy"] := my
+
+    throughEntry := (est["mode"] = "through")
+    SetClickThrough(hwnd, throughEntry)
+
+    desiredTarget := (inside && !throughEntry) ? 255 : FADE_OUT_ALPHA
+    desiredDuration := (inside && !throughEntry) ? FADE_IN_MS : FADE_OUT_MS
+
+    if !fadeState.Has(hwnd)
+        fadeState[hwnd] := Map("target", 255, "startAlpha", 255, "curAlpha", 255, "startTime", A_TickCount, "duration", 1)
+    st := fadeState[hwnd]
+
+    if (st["target"] != desiredTarget) {
+        ; 方向転換: 今の実際のアルファ値から新しい目標へ、新しい所要時間でやり直す
+        st["startAlpha"] := st["curAlpha"]
+        st["target"] := desiredTarget
+        st["startTime"] := A_TickCount
+        st["duration"] := desiredDuration
+    }
+
+    elapsed := A_TickCount - st["startTime"]
+    if (elapsed >= st["duration"])
+        alpha := st["target"]
+    else {
+        t := elapsed / st["duration"]
+        alpha := Round(st["startAlpha"] + (st["target"] - st["startAlpha"]) * t)
+    }
+    st["curAlpha"] := alpha
+    try DllCall("SetLayeredWindowAttributes", "Ptr", hwnd, "UInt", 0, "UChar", alpha, "UInt", 2)
 }
 
 UnpinWindow(hwnd) {
@@ -162,19 +327,29 @@ GetVisibleRect(hwnd, &x, &y, &w, &h) {
 ; ウィンドウ全体を覆う矩形から、内側(枠の太さぶん内側にオフセットした矩形)を
 ; くり抜いた「額縁」形のリージョンを作る。SetWindowRgn に渡すと、そのリージョンの
 ; 外は透明・クリック不可になり、4辺の枠だけが表示される。
-CreateFrameRegion(w, h, thick) {
+; radius は角の丸みの半径(px)。Windows 11 のウィンドウ角丸に合わせるため、
+; 外側だけでなく内側のくり抜きも(枠の太さぶん小さい半径で)丸めることで、
+; コーナー部分でも枠の太さが均一に見えるようにする。
+CreateFrameRegion(w, h, thick, radius := 0) {
     t := Min(thick, w // 2, h // 2)
-    outer := DllCall("gdi32\CreateRectRgn", "Int", 0, "Int", 0, "Int", w, "Int", h, "Ptr")
+    d := radius * 2
+    outer := (radius > 0)
+        ? DllCall("gdi32\CreateRoundRectRgn", "Int", 0, "Int", 0, "Int", w, "Int", h, "Int", d, "Int", d, "Ptr")
+        : DllCall("gdi32\CreateRectRgn", "Int", 0, "Int", 0, "Int", w, "Int", h, "Ptr")
     if (t <= 0)
         return outer
-    inner := DllCall("gdi32\CreateRectRgn", "Int", t, "Int", t, "Int", w - t, "Int", h - t, "Ptr")
+    innerRadius := Max(0, radius - t)
+    innerD := innerRadius * 2
+    inner := (innerRadius > 0)
+        ? DllCall("gdi32\CreateRoundRectRgn", "Int", t, "Int", t, "Int", w - t, "Int", h - t, "Int", innerD, "Int", innerD, "Ptr")
+        : DllCall("gdi32\CreateRectRgn", "Int", t, "Int", t, "Int", w - t, "Int", h - t, "Ptr")
     DllCall("gdi32\CombineRgn", "Ptr", outer, "Ptr", outer, "Ptr", inner, "Int", 4) ; RGN_DIFF
     DllCall("gdi32\DeleteObject", "Ptr", inner)
     return outer
 }
 
 UpdateOverlay(hwnd) {
-    global overlays, overlayHwnd, BORDER_COLOR, BORDER_THICK
+    global pinned, overlays, overlayHwnd, BORDER_COLOR, BORDER_THICK
     if !overlays.Has(hwnd) {
         ; -DPIScale が無いと AHK が W/H に現在の DPI 倍率(125%環境なら1.25倍等)を
         ; 勝手に掛けてしまい、指定したピクセル数より大きく表示されてしまう。
@@ -196,6 +371,11 @@ UpdateOverlay(hwnd) {
     try {
         GetVisibleRect(hwnd, &wx, &wy, &ww, &wh)
     } catch {
+        ; 直前のティックの WinExist チェックと、ここでの座標取得の間に
+        ; 対象ウィンドウが閉じた可能性が高い。枠だけが取り残されないよう、
+        ; ここでも道連れで片付ける(通常の閉じ検知は TrackPinned 側で行う)。
+        pinned.Delete(hwnd)
+        DestroyOverlay(hwnd)
         return
     }
     ; Gui.Show() は "NoActivate" を付けてもZオーダーに干渉することがあり、
@@ -204,10 +384,17 @@ UpdateOverlay(hwnd) {
     ; 一切触れない(SWP_NOZORDER)。上下関係はオーナー設定にOSが自動維持する。
     DllCall("SetWindowPos", "Ptr", ov.Hwnd, "Ptr", 0, "Int", wx, "Int", wy, "Int", ww, "Int", wh, "UInt", 0x0004 | 0x0010 | 0x0040)
     ; 0x0004=SWP_NOZORDER, 0x0010=SWP_NOACTIVATE, 0x0040=SWP_SHOWWINDOW
-    rgn := CreateFrameRegion(ww, wh, BORDER_THICK)
+
+    ; Windows 11 の既定の角丸(100%DPIで約8px相当)にDPIを合わせて枠も丸める
+    dpi := DllCall("GetDpiForWindow", "Ptr", hwnd, "UInt")
+    if !dpi
+        dpi := 96
+    cornerRadius := Round(8 * dpi / 96)
+    rgn := CreateFrameRegion(ww, wh, BORDER_THICK, cornerRadius)
     DllCall("SetWindowRgn", "Ptr", ov.Hwnd, "Ptr", rgn, "Int", true) ; 以降 rgn の所有権は OS 側
 
     EnsureAboveOwner(hwnd, ov.Hwnd)
+    UpdateFade(hwnd, wx, wy, ww, wh)
 }
 
 ; オーナー設定(生成時にSetWindowLongPtrで後付けしたもの)だけでは、切り替えを
@@ -217,13 +404,34 @@ UpdateOverlay(hwnd) {
 ; (SetWindowPos の hWndInsertAfter は「指定したウィンドウを自分の直前=上に置く」
 ;  という意味なので、対象ウィンドウ側を「枠の直後(下)」に差し込む形で直す)
 EnsureAboveOwner(hwnd, ovHwnd) {
+    global zfixStreak, zfixGiveUp
+    if zfixGiveUp.Has(hwnd)
+        return
+
     GW_HWNDPREV := 3
     above := DllCall("GetWindow", "Ptr", hwnd, "UInt", GW_HWNDPREV, "Ptr")
-    if (above != ovHwnd) {
-        LogEvent("ZORDER_FIX hwnd=" hwnd " ovHwnd=" ovHwnd " wasAbove=" above)
-        try DllCall("SetWindowPos", "Ptr", hwnd, "Ptr", ovHwnd, "Int", 0, "Int", 0, "Int", 0, "Int", 0, "UInt", 0x0001 | 0x0002 | 0x0010)
-        ; 0x0001=SWP_NOSIZE, 0x0002=SWP_NOMOVE, 0x0010=SWP_NOACTIVATE
+    if (above = ovHwnd) {
+        if zfixStreak.Has(hwnd)
+            zfixStreak.Delete(hwnd)
+        return
     }
+
+    ; Windows Terminal 等、アプリ自身が内部の補助ウィンドウ(疑似コンソール等)を
+    ; 常に自分の直上に置き直そうとするケースがあり、その場合は毎ティック補正しても
+    ; 次のティックでまた負けるだけの無限ループになる(実際に1つのウィンドウで
+    ; 数万回/数分というログ肥大が発生した)。連続で補正が必要な回数を数え、
+    ; 一定回数を超えたら「このウィンドウとは戦わない」と諦めて静かに抜ける。
+    streak := zfixStreak.Has(hwnd) ? zfixStreak[hwnd] + 1 : 1
+    zfixStreak[hwnd] := streak
+    if (streak = 1)
+        LogEvent("ZORDER_FIX hwnd=" hwnd " ovHwnd=" ovHwnd " wasAbove=" above)
+    if (streak > 5) {
+        LogEvent("ZORDER_GIVEUP hwnd=" hwnd " ovHwnd=" ovHwnd " (別ウィンドウと競合し続けるため以後の補正を停止)")
+        zfixGiveUp[hwnd] := true
+        return
+    }
+    try DllCall("SetWindowPos", "Ptr", hwnd, "Ptr", ovHwnd, "Int", 0, "Int", 0, "Int", 0, "Int", 0, "UInt", 0x0001 | 0x0002 | 0x0010)
+    ; 0x0001=SWP_NOSIZE, 0x0002=SWP_NOMOVE, 0x0010=SWP_NOACTIVATE
 }
 
 ; デバッグ用: Ctrl+Shift+Alt+D で、その瞬間の固定状況(対象/枠それぞれの座標・Zオーダー)を
@@ -252,7 +460,11 @@ DumpDiagnostics() {
 }
 
 DestroyOverlay(hwnd) {
-    global overlays, overlayHwnd
+    global overlays, overlayHwnd, zfixStreak, zfixGiveUp, entryState
+    DisableFadeSupport(hwnd)
+    SetClickThrough(hwnd, false)
+    if entryState.Has(hwnd)
+        entryState.Delete(hwnd)
     if overlays.Has(hwnd) {
         ovHwnd := overlays[hwnd].Hwnd
         LogEvent("OVERLAY_DESTROY hwnd=" hwnd " ovHwnd=" ovHwnd)
@@ -268,6 +480,10 @@ DestroyOverlay(hwnd) {
         if overlayHwnd.Has(ovHwnd)
             overlayHwnd.Delete(ovHwnd)
     }
+    if zfixStreak.Has(hwnd)
+        zfixStreak.Delete(hwnd)
+    if zfixGiveUp.Has(hwnd)
+        zfixGiveUp.Delete(hwnd)
 }
 
 ; 何らかの理由で内部管理(overlayHwnd)から外れてしまった枠ウィンドウ(幽霊)を
