@@ -31,6 +31,7 @@ fadeState    := Map()  ; 対象hwnd -> {target, startAlpha, curAlpha, startTime,
 layeredAdded := Map()  ; 対象hwnd -> true (このスクリプトが WS_EX_LAYERED を追加した場合のみ記録)
 entryState        := Map()  ; 対象hwnd -> {wasInside, mode}  ("side"=縦の辺から進入中 / "topbottom" / "")
 clickThroughAdded := Map()  ; 対象hwnd -> true (このスクリプトがクリック透過を付与した場合のみ記録)
+ovGeom      := Map()  ; 対象hwnd -> 前回適用した枠の "x,y,w,h,角丸" (変化が無い時は SetWindowPos/SetWindowRgn を呼ばない)
 
 ^+!p:: ClearAllPins()  ; 緊急脱出用: 全ての固定・枠を強制解除する
 
@@ -289,7 +290,11 @@ UpdateFade(hwnd, wx, wy, ww, wh) {
         alpha := Round(st["startAlpha"] + (st["target"] - st["startAlpha"]) * t)
     }
     st["curAlpha"] := alpha
-    try DllCall("SetLayeredWindowAttributes", "Ptr", hwnd, "UInt", 0, "UChar", alpha, "UInt", 2)
+    ; 値が変わった時だけ適用する(同じ値の再設定でも再合成が走るため)
+    if (!st.Has("applied") || st["applied"] != alpha) {
+        try DllCall("SetLayeredWindowAttributes", "Ptr", hwnd, "UInt", 0, "UChar", alpha, "UInt", 2)
+        st["applied"] := alpha
+    }
 }
 
 UnpinWindow(hwnd) {
@@ -349,7 +354,7 @@ CreateFrameRegion(w, h, thick, radius := 0) {
 }
 
 UpdateOverlay(hwnd) {
-    global pinned, overlays, overlayHwnd, BORDER_COLOR, BORDER_THICK
+    global pinned, overlays, overlayHwnd, BORDER_COLOR, BORDER_THICK, ovGeom
     if !overlays.Has(hwnd) {
         ; -DPIScale が無いと AHK が W/H に現在の DPI 倍率(125%環境なら1.25倍等)を
         ; 勝手に掛けてしまい、指定したピクセル数より大きく表示されてしまう。
@@ -382,16 +387,25 @@ UpdateOverlay(hwnd) {
     ; 2つ固定した状態で無関係なウィンドウをクリックすると2枚が入れ替わる不具合の
     ; 原因だった。ここは純粋な移動・リサイズ・表示だけを行い、Zオーダーには
     ; 一切触れない(SWP_NOZORDER)。上下関係はオーナー設定にOSが自動維持する。
-    DllCall("SetWindowPos", "Ptr", ov.Hwnd, "Ptr", 0, "Int", wx, "Int", wy, "Int", ww, "Int", wh, "UInt", 0x0004 | 0x0010 | 0x0040)
-    ; 0x0004=SWP_NOZORDER, 0x0010=SWP_NOACTIVATE, 0x0040=SWP_SHOWWINDOW
-
     ; Windows 11 の既定の角丸(100%DPIで約8px相当)にDPIを合わせて枠も丸める
     dpi := DllCall("GetDpiForWindow", "Ptr", hwnd, "UInt")
     if !dpi
         dpi := 96
     cornerRadius := Round(8 * dpi / 96)
-    rgn := CreateFrameRegion(ww, wh, BORDER_THICK, cornerRadius)
-    DllCall("SetWindowRgn", "Ptr", ov.Hwnd, "Ptr", rgn, "Int", true) ; 以降 rgn の所有権は OS 側
+
+    ; 位置・大きさ・角丸が前回と同じで枠も表示中なら、移動もリージョン再設定もしない。
+    ; 以前は 15ms 毎に無条件で SetWindowPos(SHOWWINDOW) と SetWindowRgn(再描画あり) を
+    ; 呼んでいたため、何も動いていなくても DWM が画面を毎秒約66回合成し直し、
+    ; GPU がアイドルに下がらなかった(2026-10-05 PC描画もたつき検証で判明)。
+    geom := wx "," wy "," ww "," wh "," cornerRadius
+    visible := DllCall("IsWindowVisible", "Ptr", ov.Hwnd, "Int")
+    if (!visible || !ovGeom.Has(hwnd) || ovGeom[hwnd] != geom) {
+        DllCall("SetWindowPos", "Ptr", ov.Hwnd, "Ptr", 0, "Int", wx, "Int", wy, "Int", ww, "Int", wh, "UInt", 0x0004 | 0x0010 | 0x0040)
+        ; 0x0004=SWP_NOZORDER, 0x0010=SWP_NOACTIVATE, 0x0040=SWP_SHOWWINDOW
+        rgn := CreateFrameRegion(ww, wh, BORDER_THICK, cornerRadius)
+        DllCall("SetWindowRgn", "Ptr", ov.Hwnd, "Ptr", rgn, "Int", true) ; 以降 rgn の所有権は OS 側
+        ovGeom[hwnd] := geom
+    }
 
     EnsureAboveOwner(hwnd, ov.Hwnd)
     UpdateFade(hwnd, wx, wy, ww, wh)
@@ -460,7 +474,9 @@ DumpDiagnostics() {
 }
 
 DestroyOverlay(hwnd) {
-    global overlays, overlayHwnd, zfixStreak, zfixGiveUp, entryState
+    global overlays, overlayHwnd, zfixStreak, zfixGiveUp, entryState, ovGeom
+    if ovGeom.Has(hwnd)
+        ovGeom.Delete(hwnd)
     DisableFadeSupport(hwnd)
     SetClickThrough(hwnd, false)
     if entryState.Has(hwnd)
